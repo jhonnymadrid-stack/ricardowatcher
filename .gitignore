@@ -4,5 +4,6 @@ __pycache__/
 *.pyo
 *.log
 bot_*.txt
+precios_backup.db
 precios.db
 .claude/
