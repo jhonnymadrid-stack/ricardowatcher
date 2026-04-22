@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+bot_*.txt
+precios.db
+.claude/
