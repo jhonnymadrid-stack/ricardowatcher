@@ -6,4 +6,5 @@ __pycache__/
 bot_*.txt
 precios_backup.db
 precios.db
+precios.db.backup*
 .claude/
