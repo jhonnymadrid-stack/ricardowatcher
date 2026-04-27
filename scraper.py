@@ -119,7 +119,8 @@ def _parse_obj(obj: dict) -> Optional[dict]:
     if shipping and isinstance(shipping, list):
         city = shipping[0].get("city", "")
 
-    # Only track auction listings (with or without buy-now option)
+    # Only track auction listings. Buy-now-only listings are ignored; listings
+    # that have both auction and buy-now are tracked through their auction price.
     if not has_auction:
         return None
 
@@ -133,13 +134,8 @@ def _parse_obj(obj: dict) -> Optional[dict]:
         # refines it from the listing detail page before persisting.
         price         = float(bid_price)
         current_price = float(bid_price)
-        initial_price = float(bid_price) if bid_count == 0 else None
-        price_source  = "search_start_exact" if bid_count == 0 else "search_bid_price_next_bid"
-    elif buy_now_price is not None:
-        current_price = float(buy_now_price)
-        initial_price = float(buy_now_price)
-        price         = float(buy_now_price)
-        price_source  = "buy_now"
+        initial_price = float(bid_price) if bid_count <= 1 else None
+        price_source  = "search_start_exact" if bid_count <= 1 else "search_bid_price_next_bid"
     else:
         return None
 

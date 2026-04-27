@@ -24,12 +24,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-SCAN_INTERVAL   = 2 * 60   # scrape every 2 minutes
+SCAN_INTERVAL   = 60       # scrape every 1 minute
 MAX_MISS        = 2        # misses before checking the listing page
+TRACK_WINDOW_SECS = 60 * 60
 ENDING_SOON_SECS = 30 * 60
 DAILY_SUMMARY_HOUR_UTC = 21
 DEFAULT_BID_INCREMENT = 1
-VALID_BID_INCREMENTS = (1, 5, 10, 50)
+VALID_BID_INCREMENTS = (1, 5)
 
 _state = {
     "started_at":      None,
@@ -74,6 +75,62 @@ def _estimate_bid_increment(l: dict, previous) -> int:
     return DEFAULT_BID_INCREMENT
 
 
+def _infer_bid_increment_from_snapshots(lid: str, final_price: float | None = None,
+                                        final_bid_count: int | None = None) -> int:
+    """Infer whether Ricardo is moving this auction by CHF 1 or CHF 5."""
+    snaps = list(reversed(get_price_snapshots(lid, limit=30)))
+    points: list[tuple[float, int]] = []
+    for snap in snaps:
+        if snap["price"] is None or snap["bid_count"] is None:
+            continue
+        points.append((float(snap["price"]), int(snap["bid_count"] or 0)))
+
+    if final_price is not None and final_bid_count is not None:
+        point = (float(final_price), int(final_bid_count or 0))
+        if not points or points[-1] != point:
+            points.append(point)
+
+    increments: list[int] = []
+    raw_deltas: list[float] = []
+    for (prev_price, prev_bids), (price, bids) in zip(points, points[1:]):
+        bid_delta = bids - prev_bids
+        price_delta = price - prev_price
+        if bid_delta <= 0 or price_delta <= 0:
+            continue
+        raw_deltas.append(price_delta)
+        snapped = _snap_bid_increment(price_delta / bid_delta)
+        if snapped is not None:
+            increments.append(snapped)
+
+    if increments:
+        return min(increments)
+
+    # If the observed price ever moves by a non-CHF-5 amount, the auction cannot
+    # be using CHF 5 steps. Example: 64 -> 67 means CHF 1 steps.
+    for delta in raw_deltas:
+        if abs(delta % 5) > 0.05 and abs((delta % 5) - 5) > 0.05:
+            return 1
+
+    return DEFAULT_BID_INCREMENT
+
+
+def _infer_initial_price(row, final_price: float) -> tuple[float | None, str | None]:
+    if row["initial_price"] is not None:
+        return float(row["initial_price"]), row["initial_price_source"]
+
+    bid_count = int(row["bid_count"] or 0)
+    if bid_count <= 0:
+        return None, None
+    if bid_count == 1:
+        return float(final_price), "inferred_single_bid_final"
+
+    increment = _infer_bid_increment_from_snapshots(row["id"], final_price, bid_count)
+    initial = float(final_price) - (bid_count - 1) * increment
+    if initial < 0:
+        return None, None
+    return initial, f"inferred_final_minus_{bid_count - 1}_bids_x_{increment}"
+
+
 def _normalize_search_prices(l: dict, previous=None):
     """Convert Ricardo search bidPrice into estimated current winning price."""
     if not _is_next_bid_source(l.get("price_source")):
@@ -115,11 +172,22 @@ def _normalize_search_prices(l: dict, previous=None):
 
 def _stable_sale_price(lid: str, fallback_row) -> tuple[float, str]:
     """Pick the most reliable observed price before the listing disappeared."""
-    snaps = get_price_snapshots(lid, limit=12)
+    snaps = get_price_snapshots(lid, limit=30)
     if not snaps:
         return float(fallback_row["current_price"]), fallback_row["price_source"] or "unknown"
 
-    # A direct page scrape is always more reliable than any estimate.
+    closing_snaps = [
+        snap for snap in snaps
+        if snap["price"] is not None
+        and snap["seconds_remaining"] is not None
+        and snap["seconds_remaining"] <= 60
+    ]
+    if closing_snaps:
+        snap = closing_snaps[0]
+        return float(snap["price"]), snap["price_source"] or "closing_snapshot_under_1min"
+
+    # A direct page scrape is more reliable than a search-result next-bid
+    # estimate when we missed the last-minute snapshot.
     for snap in snaps:
         if snap["price_source"] == "detail_current" and snap["price"] is not None:
             return float(snap["price"]), "detail_current"
@@ -156,37 +224,42 @@ async def tg_photo(photo_bytes: bytes, caption: str, client: httpx.AsyncClient):
 # ── Scrape all queries, return {id: listing+category} ─────────────────────────
 
 async def scrape_all(session: AsyncSession) -> dict[str, dict]:
-    """Return classified auction listings, including zero-bid starts."""
+    """Return classified auctions ending within the next hour."""
     found: dict[str, dict] = {}
     for query in SEARCH_QUERIES:
-        # newest: discover new listings; end_date: keep ending auctions visible
-        for sort in ("newest", "end_date"):
-            listings = await search_ricardo(query, session, sort=sort)
-            for l in listings:
-                if l["id"] in found:
-                    continue
-                match = classify(l["title"])
-                if match is None:
-                    continue
+        listings = await search_ricardo(query, session, sort="end_date")
+        for l in listings:
+            if l["id"] in found:
+                continue
+            seconds = l.get("seconds_remaining")
+            if seconds is None or seconds > TRACK_WINDOW_SECS:
+                continue
+            match = classify(l["title"])
+            if match is None:
+                continue
 
-                detail_prices = await fetch_listing_prices(l["id"], session)
-                if detail_prices["current_price"] is not None:
-                    l["current_price"] = detail_prices["current_price"]
-                    l["price"] = detail_prices["current_price"]
-                    l["price_source"] = "detail_current"
-                if detail_prices["initial_price"] is not None:
-                    l["initial_price"] = detail_prices["initial_price"]
-                    l["initial_price_source"] = "detail_start"
-                elif l["initial_price"] is not None:
-                    l["initial_price_source"] = l["price_source"]
-                else:
-                    l["initial_price_source"] = None
+            detail_prices = await fetch_listing_prices(l["id"], session)
+            if detail_prices["current_price"] is not None:
+                l["current_price"] = detail_prices["current_price"]
+                l["price"] = detail_prices["current_price"]
+                l["price_source"] = "detail_current"
+            if detail_prices["initial_price"] is not None:
+                l["initial_price"] = detail_prices["initial_price"]
+                l["initial_price_source"] = "detail_start"
+            elif l["initial_price"] is not None:
+                l["initial_price_source"] = l["price_source"]
+            else:
+                l["initial_price_source"] = None
 
-                l["category"] = match.category
-                l["display"] = match.display
-                l["storage"] = match.storage
-                found[l["id"]] = l
-            await asyncio.sleep(2)
+            if (l.get("bid_count") or 0) == 1:
+                l["initial_price"] = l["current_price"]
+                l["initial_price_source"] = "single_bid_current"
+
+            l["category"] = match.category
+            l["display"] = match.display
+            l["storage"] = match.storage
+            found[l["id"]] = l
+        await asyncio.sleep(2)
     return found
 
 
@@ -252,7 +325,8 @@ def _row_to_listing_dict(row, seconds_remaining: int | None = None) -> dict:
     }
 
 
-async def _notify_sale(lid: str, row, sale_type: str, final_price: float):
+async def _notify_sale(lid: str, row, sale_type: str, final_price: float,
+                       initial_price: float | None = None):
     """Send Telegram notification for a confirmed sale."""
     cat_avg = None
     try:
@@ -264,7 +338,9 @@ async def _notify_sale(lid: str, row, sale_type: str, final_price: float):
         pass
 
     tipo = "subasta" if sale_type == "auction" else "buy now"
-    initial = float(row["initial_price"]) if row["initial_price"] is not None else None
+    initial = initial_price
+    if initial is None and row["initial_price"] is not None:
+        initial = float(row["initial_price"])
     bids = row["bid_count"] or 0
     if initial is not None:
         uplift = final_price - initial
@@ -329,20 +405,22 @@ async def _record_ended_listing(lid: str, row, label: str, session=None):
         except Exception:
             pass
 
+    initial_price, initial_price_source = _infer_initial_price(row, final_price)
+
     record_sale(
         lid, row["title"], row["url"], row["category"], row["storage"],
-        row["initial_price"], final_price, sale_type, row["bid_count"],
-        final_price_source, row["initial_price_source"],
+        initial_price, final_price, sale_type, row["bid_count"],
+        final_price_source, initial_price_source,
     )
     print(f"  ✅ VENDIDO{label}: {row['title']} CHF {final_price}")
-    await _notify_sale(lid, row, sale_type, final_price)
+    await _notify_sale(lid, row, sale_type, final_price, initial_price)
 
 
-# ── Main scan loop (every 2 min) ─────────────────────────────────────────────
+# ── Main scan loop (every 1 min) ─────────────────────────────────────────────
 
 async def scan_loop():
     _state["started_at"] = datetime.now(timezone.utc)
-    print("[Scan] Iniciado — scrapeando cada 2 min buscando subastas con pujas")
+    print("[Scan] Iniciado — scrapeando cada 1 min subastas ending soon (<1h)")
 
     async with AsyncSession(impersonate="chrome124") as session:
         while True:
@@ -394,6 +472,10 @@ async def scan_loop():
                 for lid in disappeared:
                     row = get_listing(lid)
                     if not row:
+                        continue
+                    remaining = _effective_seconds_remaining(row)
+                    if remaining is not None and remaining > TRACK_WINDOW_SECS:
+                        mark_status(lid, "outside_window")
                         continue
 
                     misses = increment_miss(lid)
@@ -523,7 +605,7 @@ async def cmd_status(chat_id: int, client: httpx.AsyncClient):
     text = (
         f"<b>Ricardo Watcher activo</b>\n\n"
         f"Uptime: {uptime}\n"
-        f"Proximo scan: {next_str} (cada 2 min)\n\n"
+        f"Proximo scan: {next_str} (cada 1 min)\n\n"
         f"Subastas seguidas: <b>{counts['active']}</b>\n"
         f"Nuevas ultimo scan: {new_str}\n"
         f"Ventas registradas: <b>{counts['sales']}</b>"
